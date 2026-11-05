@@ -25,6 +25,20 @@ public:
 
     void set_generation_config(ov::genai::GenerationConfig config);
 
+    /**
+     * @brief Switches between greedy argmax sampling (default) and caller-side stochastic sampling.
+     *
+     * When enabled, infer_first(), infer_next() and infer_next_return_all() skip the argmax, do not
+     * update the internal last token and return -1 (or an empty vector). The caller reads the logits
+     * through get_logits(), samples, and reports the final token with set_last_token().
+     */
+    void set_stochastic_sampling(bool enabled);
+
+    /**
+     * @brief Sets the token that can_infer() checks against EOS and stop token ids.
+     */
+    void set_last_token(int64_t token);
+
     int64_t get_kvcache_capacity() const;
 
     int64_t get_generation_capacity() const;
@@ -71,6 +85,7 @@ private:
     std::size_t m_first_prompt_len = 0u;
     std::size_t m_num_processed_tokens = 0u;
     int64_t last_token = -1;
+    bool m_stochastic_sampling = false;
     ov::genai::utils::KVAxesPosition m_kv_pos;
     ov::InferRequest m_request;
     ov::genai::utils::CacheTypes m_cache_types;

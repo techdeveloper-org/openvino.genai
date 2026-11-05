@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "fast_draft_strategy.hpp"
-#include "continuous_batching/timer.hpp"
-#include "openvino/runtime/core.hpp"
-#include "openvino/core/parallel.hpp"
-#include "openvino/genai/text_streamer.hpp"
 
 #include <algorithm>
+
+#include "continuous_batching/timer.hpp"
+#include "openvino/core/parallel.hpp"
+#include "openvino/genai/text_streamer.hpp"
+#include "openvino/runtime/core.hpp"
+#include "speculative_decoding/stateful/fast_draft_sampling.hpp"
 
 namespace ov::genai {
 template<class... Ts> struct overloaded : Ts... {using Ts::operator()...;};
@@ -82,6 +84,14 @@ void LLMInferWrapper::set_generation_config(ov::genai::GenerationConfig config) 
     m_generation_config = std::move(config);
 }
 
+void LLMInferWrapper::set_stochastic_sampling(bool enabled) {
+    m_stochastic_sampling = enabled;
+}
+
+void LLMInferWrapper::set_last_token(int64_t token) {
+    last_token = token;
+}
+
 int64_t LLMInferWrapper::get_kvcache_capacity() const {
     if (m_device == "NPU") {
         return m_kvcache_total - m_num_processed_tokens;
@@ -139,14 +149,18 @@ int64_t LLMInferWrapper::infer_first(const ov::Tensor &input_ids,
     m_new_atten_mask_data = std::vector<int64_t>(m_num_processed_tokens, 1);
     set_already_allocated_input_for_1_token();
 
-    // Update last_token variable for `can_infer()` logic:
-    last_token = std::get<int64_t>(sample_tokens(get_logits(), 1u));
+    int64_t sampled_token = -1;
+    if (!m_stochastic_sampling) {
+        // Update last_token variable for `can_infer()` logic:
+        last_token = std::get<int64_t>(sample_tokens(get_logits(), 1u));
+        sampled_token = last_token;
+    }
 
     infer_first_timer.end();
     update_perf_stat_by_infer_duration(raw_perf_metrics,
          ov::genai::PerfMetrics::get_microsec(infer_end - infer_start),
          infer_first_timer.get_duration_microsec(), BATCH_SIZE);
-    return last_token;
+    return sampled_token;
 }
 
 bool LLMInferWrapper::can_infer(const std::size_t prompt_len) {
@@ -191,8 +205,12 @@ int64_t LLMInferWrapper::infer_next(int64_t token, bool append_perf_stat) {
 
     m_num_processed_tokens += 1u;
 
-    // Update last_token variable for `can_infer()` logic:
-    last_token = std::get<int64_t>(sample_tokens(get_logits(), 1u));
+    int64_t sampled_token = -1;
+    if (!m_stochastic_sampling) {
+        // Update last_token variable for `can_infer()` logic:
+        last_token = std::get<int64_t>(sample_tokens(get_logits(), 1u));
+        sampled_token = last_token;
+    }
 
     infer_next_timer.end();
     // prepend perf stat
@@ -209,7 +227,7 @@ int64_t LLMInferWrapper::infer_next(int64_t token, bool append_perf_stat) {
             ov::genai::MicroSeconds(ov::genai::PerfMetrics::get_microsec(infer_end - infer_start));
     }
 
-    return last_token;
+    return sampled_token;
 }
 
 std::vector<int64_t> LLMInferWrapper::infer_next_return_all(const std::vector<int64_t>& tokens) {
@@ -253,10 +271,13 @@ std::vector<int64_t> LLMInferWrapper::infer_next_return_all(const std::vector<in
     }
     set_already_allocated_input_for_1_token();
 
-    auto logits = get_logits();
-    auto sampled_tokens = std::get<std::vector<int64_t>>(sample_tokens(logits, tokens_size));
-    // Update last_token variable for `can_infer()` logic:
-    last_token = sampled_tokens.back();
+    std::vector<int64_t> sampled_tokens;
+    if (!m_stochastic_sampling) {
+        auto logits = get_logits();
+        sampled_tokens = std::get<std::vector<int64_t>>(sample_tokens(logits, tokens_size));
+        // Update last_token variable for `can_infer()` logic:
+        last_token = sampled_tokens.back();
+    }
 
     infer_next_return_all_timer.end();
     update_perf_stat_by_infer_duration(
@@ -433,13 +454,47 @@ EncodedResults StatefulSpeculativeLLMPipeline::generate_tokens(const EncodedInpu
     const size_t batch_size = prompt_shape[0];
     OPENVINO_ASSERT(batch_size == 1u, "Currently only batch size=1 is supported");
 
-    OPENVINO_ASSERT(config.is_greedy_decoding(),
-        "Currently only greedy decoding is supported");
+    const bool stochastic = !config.is_greedy_decoding();
+    speculative_sampling::SamplingParams sampling_params;
+    if (stochastic) {
+        sampling_params = speculative_sampling::make_sampling_params(config);
+    }
 
     OPENVINO_ASSERT(config.num_return_sequences == 1u,
         "Currently only \"num_return_sequences\" equal to 1 is supported!");
 
     m_main_request->set_generation_config(config);
+    m_main_request->set_stochastic_sampling(stochastic);
+    m_draft_request->set_stochastic_sampling(stochastic);
+
+    std::mt19937 sampling_rng(static_cast<uint32_t>(config.rng_seed));
+    speculative_sampling::Scratch sampling_scratch;
+    speculative_sampling::ProbRow sampling_row;
+    std::vector<speculative_sampling::ProbRow> draft_rows;
+    std::vector<speculative_sampling::ProbRow> target_rows;
+    if (stochastic) {
+        draft_rows.resize(m_max_candidates_num);
+        target_rows.resize(m_max_candidates_num + 1);
+    }
+
+    // Probabilities are built from a copy of the logits row, so the infer request's output tensor is
+    // never modified and can be overwritten by the next infer without affecting stored rows.
+    const auto build_row = [&](const ov::Tensor& logits, std::size_t row_from_end, speculative_sampling::ProbRow& out) {
+        const auto& shape = logits.get_shape();
+        OPENVINO_ASSERT(shape.size() == 3u && shape[0] == 1u && row_from_end >= 1u && row_from_end <= shape[1],
+                        "Unexpected logits shape for stochastic sampling");
+        const std::size_t vocab_size = shape[2];
+        const float* row = logits.data<float>() + (shape[1] - row_from_end) * vocab_size;
+        speculative_sampling::compute_probs(row, vocab_size, vocab_size, sampling_params, out, sampling_scratch);
+    };
+
+    const auto sample_last_token = [&](LLMInferWrapper& wrapper) {
+        build_row(wrapper.get_logits(), 1u, sampling_row);
+        const auto token = static_cast<int64_t>(
+            speculative_sampling::sample_from(sampling_row, speculative_sampling::uniform01(sampling_rng)));
+        wrapper.set_last_token(token);
+        return token;
+    };
 
     // Config draft model to not stop on EOS and remove stop strings:
     ov::genai::GenerationConfig draft_config = m_draft_request->get_generation_config();
@@ -473,6 +528,9 @@ EncodedResults StatefulSpeculativeLLMPipeline::generate_tokens(const EncodedInpu
     first_token_timer.start();
 
     auto out_token = m_main_request->infer_first(input_ids, attention_mask, position_ids);
+    if (stochastic) {
+        out_token = sample_last_token(*m_main_request);
+    }
 
     first_token_timer.end();
     update_perf_stat_by_token_time(raw_perf_counters, first_token_timer.get_duration_microsec(),
@@ -553,6 +611,9 @@ EncodedResults StatefulSpeculativeLLMPipeline::generate_tokens(const EncodedInpu
                 for (std::size_t i = 0; i < remainder; ++i) {
                     main_timer.start();
                     out_token = m_main_request->infer_next(out_token);
+                    if (stochastic) {
+                        out_token = sample_last_token(*m_main_request);
+                    }
                     main_timer.end();
 
                     streaming_status = stream_generated_tokens(streamer_ptr, {out_token});
@@ -581,12 +642,23 @@ EncodedResults StatefulSpeculativeLLMPipeline::generate_tokens(const EncodedInpu
         // Note: If `draft_prefix_exists == true`, then we append performance metrics of
         // newly generated candidate to the previously generated token on draft prefix prompt,
         // as we are only interested in one output from these two inference operations.
-        int64_t candidate = m_draft_request->infer_next(out_token, draft_prefix_exists);
-        candidates.push_back(candidate);
-
-        for (size_t i = 1; i < candidates_to_generate; i++) {
-            candidate = m_draft_request->infer_next(candidate);
+        if (stochastic) {
+            candidates = speculative_sampling::draft_candidates(
+                static_cast<std::size_t>(candidates_to_generate),
+                out_token,
+                [&](int64_t token, std::size_t index, speculative_sampling::ProbRow& row) {
+                    m_draft_request->infer_next(token, index == 0u && draft_prefix_exists);
+                    build_row(m_draft_request->get_logits(), 1u, row);
+                },
+                draft_rows,
+                sampling_rng);
+        } else {
+            int64_t candidate = m_draft_request->infer_next(out_token, draft_prefix_exists);
             candidates.push_back(candidate);
+            for (size_t i = 1; i < candidates_to_generate; i++) {
+                candidate = m_draft_request->infer_next(candidate);
+                candidates.push_back(candidate);
+            }
         }
         draft_prefix_token = candidates.back();
 
@@ -615,30 +687,81 @@ EncodedResults StatefulSpeculativeLLMPipeline::generate_tokens(const EncodedInpu
 
         // Phase 3. Validation of candidates by output of main model:
         size_t accepted_tokens_number = 0u;
-        // Last token is a new token from the main model, skip it:
-        for (size_t i = 0; i < ref_tokens.size() - 1; ++i) {
-            if (ref_tokens[i] != candidates[i]) {
-                break;
+        std::vector<int64_t> validated_tokens;
+        if (stochastic) {
+            // Leviathan et al. accept/resample over the main model rows q_0..q_K and the stored
+            // draft rows p_0..p_{K-1}; both are built by the same filter chain.
+            const auto main_logits_for_rows = m_main_request->get_logits();
+            const auto& main_shape = main_logits_for_rows.get_shape();
+            OPENVINO_ASSERT(main_shape.size() == 3u && main_shape[0] == 1u,
+                            "Unexpected logits shape for stochastic sampling");
+            const auto verification = speculative_sampling::verify_block(main_logits_for_rows.data<float>(),
+                                                                         main_shape[1],
+                                                                         main_shape[2],
+                                                                         candidates,
+                                                                         draft_rows,
+                                                                         target_rows,
+                                                                         sampling_params,
+                                                                         sampling_scratch,
+                                                                         sampling_rng);
+            accepted_tokens_number = verification.num_accepted;
+            validated_tokens.assign(candidates.begin(),
+                                    candidates.begin() + static_cast<std::ptrdiff_t>(accepted_tokens_number));
+            validated_tokens.push_back(verification.final_token);
+        } else {
+            // Last token is a new token from the main model, skip it:
+            for (size_t i = 0; i < ref_tokens.size() - 1; ++i) {
+                if (ref_tokens[i] != candidates[i]) {
+                    break;
+                }
+                accepted_tokens_number++;
             }
-            accepted_tokens_number++;
+            validated_tokens.assign(ref_tokens.begin(),
+                                    ref_tokens.end() - (candidates.size() - accepted_tokens_number));
         }
 
         auto mismatched_candidates = candidates.size() - accepted_tokens_number;
-        std::vector<int64_t> validated_tokens(ref_tokens.begin(), ref_tokens.end() - mismatched_candidates);
         out_token = validated_tokens.back();
 
+        // Tokens after an EOS or stop token accepted inside the block must not reach the output. The KV
+        // caches then hold those accepted tokens, so they are trimmed together with the rejected ones.
+        size_t main_trim = mismatched_candidates;
+        size_t draft_trim = mismatched_candidates > 0 ? mismatched_candidates - 1 : 0;
+        bool drop_draft_prefix = mismatched_candidates > 0;
+        if (stochastic) {
+            const auto is_stop_token = [&config](int64_t token) {
+                return (!config.ignore_eos && token == config.eos_token_id) || config.stop_token_ids.count(token) > 0;
+            };
+            const auto stop_it = std::find_if(validated_tokens.begin(), validated_tokens.end(), is_stop_token);
+            const auto stop_index = stop_it == validated_tokens.end()
+                                        ? speculative_sampling::kNoStopToken
+                                        : static_cast<std::size_t>(stop_it - validated_tokens.begin());
+            const auto commit =
+                speculative_sampling::plan_commit(candidates.size(), accepted_tokens_number, stop_index);
+            validated_tokens.resize(commit.output_length);
+            out_token = validated_tokens.back();
+            main_trim = commit.main_trim;
+            draft_trim = commit.draft_trim;
+            drop_draft_prefix = commit.drop_draft_prefix;
+        }
+
         // Phase 4: Update inference wrappers based on found matches and mismatches
-        if (mismatched_candidates > 0) {
-            m_draft_request->trim_kv_cache(mismatched_candidates - 1);
-            m_main_request->trim_kv_cache(mismatched_candidates);
+        if (main_trim > 0u) {
+            m_draft_request->trim_kv_cache(draft_trim);
+            m_main_request->trim_kv_cache(main_trim);
+        }
+        if (drop_draft_prefix) {
             // We don't need last candidate in KVCache of draft model, as
             // it fails validation.
             draft_prefix_token = -1;
         }
+        if (stochastic) {
+            m_main_request->set_last_token(out_token);
+        }
         update_candidate_strategy(accepted_tokens_number);
 
         auto& main_perf_generated_tokens = m_main_request->raw_perf_metrics.m_batch_sizes.back();
-        main_perf_generated_tokens -= mismatched_candidates;
+        main_perf_generated_tokens -= main_trim;
         m_sd_perf_metrics.num_draft_tokens += candidates_to_generate;
         m_sd_perf_metrics.num_accepted_tokens += accepted_tokens_number;
         m_sd_metrics.update_draft_generated_len(0 /* request_id */, candidates_to_generate);
